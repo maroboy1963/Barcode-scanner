@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Inventory Scanner — Debugged</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      padding: 15px;
+      margin: 0;
+      background: #f8f9fa;
+      color: #111;
+    }
+    .app { max-width: 720px; margin: 0 auto; }
+    h2 { margin: 0 0 8px; }
+    .status {
+      padding: 10px 12px;
+      border-radius: 7px;
+      background: #e9ecef;
+      margin-bottom: 12px;
+      font-size: 14px;
+    }
+    .status.ok { background: #e8f7ec; color: #176b2c; }
+    .status.error { background: #fdecec; color: #9b1c1c; }
+    .status.busy { background: #fff4d6; color: #7a5500; }
+    #reader { width: 100%; overflow: hidden; border-radius: 8px; background: #000; }
+    #reader video { width: 100% !important; max-height: 300px; object-fit: cover; }
+    label { font-weight: 650; display: block; margin-top: 10px; }
+    input {
+      width: 100%;
+      padding: 11px;
+      margin-top: 4px;
+      border: 1px solid #c9cdd2;
+      border-radius: 6px;
+      font-size: 16px;
+      background: #fff;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      margin-top: 12px;
+      font-size: 16px;
+      font-weight: 700;
+      color: #fff;
+      border: 0;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .btn-scan { background: #007aff; }
+    .btn-camera { background: #5856d6; }
+    .btn-save { background: #34c759; }
+    .btn-export { background: #ff9500; }
+    .btn-clear { background: #6c757d; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .count { margin: 12px 0 0; font-size: 14px; color: #555; }
+    @media (max-width: 520px) { .row { grid-template-columns: 1fr; gap: 0; } }
+  </style>
+  <script src="https://unpkg.com/html5-qrcode"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+</head>
+<body>
+<div class="app">
+  <h2>Inventory Label Scanner</h2>
+  <div id="status" class="status">Initializing…</div>
+  <div id="reader"></div>
+
+  <button id="cameraBtn" class="btn-camera" type="button">▶ Start Camera</button>
+  <button id="ocrBtn" class="btn-scan" type="button" disabled>📷 Capture &amp; Read Text</button>
+
+  <div class="row">
+    <div>
+      <label for="code">Code Number</label>
+      <input type="text" id="code" placeholder="Detected code number…" autocomplete="off">
+    </div>
+    <div>
+      <label for="barcode">Barcode</label>
+      <input type="text" id="barcode" placeholder="Scanned barcode value…" autocomplete="off">
+    </div>
+  </div>
+
+  <label for="desc">Description</label>
+  <input type="text" id="desc" placeholder="Detected text description…" autocomplete="off">
+
+  <label for="qty">Quantity</label>
+  <input type="number" id="qty" min="0" step="1" placeholder="Enter stock quantity…" inputmode="numeric">
+
+  <button id="saveBtn" class="btn-save" type="button">💾 Add to Inventory</button>
+  <button id="exportBtn" class="btn-export" type="button">📥 Download CSV</button>
+  <button id="clearBtn" class="btn-clear" type="button">🗑 Clear Saved Inventory</button>
+  <div id="count" class="count"></div>
+</div>
+
+<script>
+'use strict';
+
+const STORAGE_KEY = 'inventoryScannerItemsV2';
+let inventory = loadInventory();
+let html5QrCode = null;
+let scannerRunning = false;
+let ocrBusy = false;
+let lastScannedBarcode = '';
+let lastScanAt = 0;
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+const cameraBtn = $('cameraBtn');
+const ocrBtn = $('ocrBtn');
+
+function setStatus(message, type = '') {
+  statusEl.textContent = message;
+  statusEl.className = `status ${type}`.trim();
+}
+
+function updateCount() {
+  $('count').textContent = `${inventory.length} item${inventory.length === 1 ? '' : 's'} saved on this device.`;
+}
+
+function loadInventory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    console.error('Could not load inventory:', err);
+    return [];
+  }
+}
+
+function persistInventory() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(inventory));
+  } catch (err) {
+    console.error('Could not persist inventory:', err);
+    setStatus('Item saved for this session, but browser storage failed.', 'error');
+  }
+}
+
+function handleDecodedBarcode(decodedText) {
+  const now = Date.now();
+  // Prevent the continuous video stream from repeatedly processing the same code.
+  if (decodedText === lastScannedBarcode && now - lastScanAt < 2000) return;
+
+  lastScannedBarcode = decodedText;
+  lastScanAt = now;
+  $('barcode').value = decodedText;
+  setStatus(`Barcode scanned: ${decodedText}`, 'ok');
+}
+
+async function startCamera() {
+  if (scannerRunning) {
+    await stopCamera();
+    return;
+  }
+
+  if (!window.isSecureContext && location.hostname !== 'localhost') {
+    setStatus('Camera access requires HTTPS (or localhost). Open this page from a secure site.', 'error');
+    return;
+  }
+
+  if (typeof Html5Qrcode === 'undefined') {
+    setStatus('Barcode library failed to load. Check the internet connection and reload.', 'error');
+    return;
+  }
+
+  try {
+    setStatus('Requesting camera permission…', 'busy');
+    cameraBtn.disabled = true;
+
+    html5QrCode = html5QrCode || new Html5Qrcode('reader');
+
+    await html5QrCode.start(
+      { facingMode: { ideal: 'environment' } },
+      { fps: 10, qrbox: { width: 250, height: 150 }, aspectRatio: 1.333334 },
+      handleDecodedBarcode,
+      () => {}
+    );
+
+    scannerRunning = true;
+    cameraBtn.textContent = '■ Stop Camera';
+    ocrBtn.disabled = false;
+    setStatus('Camera ready. Scan a barcode or capture the label for OCR.', 'ok');
+  } catch (err) {
+    console.error('Camera start failed:', err);
+    const message = err && err.message ? err.message : String(err);
+    setStatus(`Camera could not start: ${message}`, 'error');
+  } finally {
+    cameraBtn.disabled = false;
+  }
+}
+
+async function stopCamera() {
+  try {
+    cameraBtn.disabled = true;
+    if (html5QrCode && scannerRunning) await html5QrCode.stop();
+    scannerRunning = false;
+    cameraBtn.textContent = '▶ Start Camera';
+    ocrBtn.disabled = true;
+    setStatus('Camera stopped.');
+  } catch (err) {
+    console.error('Camera stop failed:', err);
+    setStatus('Camera stop failed. Reload the page if the camera remains active.', 'error');
+  } finally {
+    cameraBtn.disabled = false;
+  }
+}
+
+async function captureAndProcess() {
+  if (ocrBusy) return;
+
+  const videoElem = document.querySelector('#reader video');
+  if (!videoElem || videoElem.readyState < 2 || !videoElem.videoWidth) {
+    setStatus('Camera video is not ready yet.', 'error');
+    return;
+  }
+
+  if (!window.Tesseract) {
+    setStatus('OCR library failed to load. Check the internet connection and reload.', 'error');
+    return;
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = videoElem.videoWidth;
+  canvas.height = videoElem.videoHeight;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    setStatus('Unable to create an image for OCR.', 'error');
+    return;
+  }
+
+  ctx.drawImage(videoElem, 0, 0, canvas.width, canvas.height);
+
+  try {
+    ocrBusy = true;
+    ocrBtn.disabled = true;
+    setStatus('Reading label text…', 'busy');
+
+    const result = await Tesseract.recognize(canvas, 'eng', {
+      logger: (m) => {
+        if (m.status === 'recognizing text' && typeof m.progress === 'number') {
+          setStatus(`Reading label text… ${Math.round(m.progress * 100)}%`, 'busy');
+        }
+      }
+    });
+
+    const text = result?.data?.text || '';
+    const lines = text
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    if (!lines.length) {
+      setStatus('No readable text detected. Move closer, improve lighting, and try again.', 'error');
+      return;
+    }
+
+    $('code').value = lines[0];
+    $('desc').value = lines.slice(1).join(' ');
+    $('qty').focus();
+    setStatus('Label text captured. Review it, enter quantity, then save.', 'ok');
+  } catch (err) {
+    console.error('OCR failed:', err);
+    const message = err && err.message ? err.message : String(err);
+    setStatus(`OCR failed: ${message}`, 'error');
+  } finally {
+    ocrBusy = false;
+    ocrBtn.disabled = !scannerRunning;
+  }
+}
+
+function saveItem() {
+  const code = $('code').value.trim();
+  const desc = $('desc').value.trim();
+  const barcode = $('barcode').value.trim();
+  const qtyRaw = $('qty').value.trim();
+
+  if (!code && !desc && !barcode) {
+    setStatus('Enter or scan at least a code, description, or barcode.', 'error');
+    return;
+  }
+
+  if (qtyRaw === '') {
+    setStatus('Please enter a quantity.', 'error');
+    $('qty').focus();
+    return;
+  }
+
+  const qty = Number(qtyRaw);
+  if (!Number.isFinite(qty) || qty < 0 || !Number.isInteger(qty)) {
+    setStatus('Quantity must be a whole number of 0 or more.', 'error');
+    $('qty').focus();
+    return;
+  }
+
+  inventory.push({
+    code,
+    desc,
+    barcode,
+    qty,
+    savedAt: new Date().toISOString()
+  });
+  persistInventory();
+  updateCount();
+
+  $('code').value = '';
+  $('desc').value = '';
+  $('barcode').value = '';
+  $('qty').value = '';
+  lastScannedBarcode = '';
+  lastScanAt = 0;
+
+  setStatus('Item added successfully.', 'ok');
+}
+
+function csvEscape(value) {
+  const text = String(value ?? '');
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function exportCSV() {
+  if (!inventory.length) {
+    setStatus('No items to export.', 'error');
+    return;
+  }
+
+  const rows = [
+    ['Code Number', 'Description', 'Barcode', 'Quantity', 'Saved At'],
+    ...inventory.map(row => [row.code, row.desc, row.barcode, row.qty, row.savedAt || ''])
+  ];
+
+  const csv = '\uFEFF' + rows.map(row => row.map(csvEscape).join(',')).join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `inventory_count_${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+  setStatus(`Exported ${inventory.length} inventory item${inventory.length === 1 ? '' : 's'}.`, 'ok');
+}
+
+function clearInventory() {
+  if (!inventory.length) {
+    setStatus('Inventory is already empty.');
+    return;
+  }
+  if (!confirm(`Delete all ${inventory.length} saved inventory items from this browser?`)) return;
+  inventory = [];
+  localStorage.removeItem(STORAGE_KEY);
+  updateCount();
+  setStatus('Saved inventory cleared.');
+}
+
+cameraBtn.addEventListener('click', startCamera);
+ocrBtn.addEventListener('click', captureAndProcess);
+$('saveBtn').addEventListener('click', saveItem);
+$('exportBtn').addEventListener('click', exportCSV);
+$('clearBtn').addEventListener('click', clearInventory);
+
+window.addEventListener('beforeunload', () => {
+  if (html5QrCode && scannerRunning) {
+    html5QrCode.stop().catch(() => {});
+  }
+});
+
+updateCount();
+setStatus('Ready. Tap “Start Camera”.');
+</script>
+</body>
+</html>
